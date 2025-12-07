@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Domain Shift Detector</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 0; background: #0b0d10; color: #e8eaed; }
+    header { padding: 16px 20px; border-bottom: 1px solid #20242a; }
+    main { padding: 16px 20px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    input[type=text], select { padding: 8px 10px; border-radius: 6px; border: 1px solid #2b3038; background: #121417; color: #e8eaed; }
+    button { padding: 8px 14px; border-radius: 6px; border: 1px solid #2b3038; background: #1b1f24; color: #e8eaed; cursor: pointer; }
+    button:hover { background: #22272e; }
+    button[disabled] { opacity: .6; cursor: not-allowed; }
+    .controls { display: grid; gap: 10px; margin-bottom: 14px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel { background: #0f1216; border: 1px solid #1d2128; border-radius: 10px; padding: 12px; }
+    .panel h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: #9aa0a6; }
+    #video { width: 100%; height: auto; background: #000; border-radius: 8px; border: 1px solid #1d2128; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #1d2128; font-size: 13px; }
+    th { color: #9aa0a6; text-align: left; font-weight: 600; }
+    #status { font-size: 12px; color: #9aa0a6; margin-left: 8px; }
+    .spacer { flex: 1; }
+    .tabs { display: flex; gap: 8px; padding: 8px 20px 0; border-bottom: 1px solid #20242a; }
+    .tab-button { padding: 6px 12px; border-radius: 999px; border: none; background: transparent; color: #9aa0a6; font-size: 13px; cursor: pointer; }
+    .tab-button.active { background: #1b1f24; color: #e8eaed; }
+    .tab-button:hover { background: #15191f; }
+    .hidden { display: none; }
+    .summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .summary-card { background: #0b0d10; border-radius: 8px; padding: 10px 12px; border: 1px solid #1d2128; min-height: 60px; }
+    .summary-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #80868b; margin-bottom: 4px; }
+    .summary-value { font-size: 18px; font-weight: 600; }
+    .summary-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { padding: 3px 8px; border-radius: 999px; font-size: 11px; background: #11151a; border: 1px solid #232933; color: #e8eaed; }
+    .chip-muted { color: #9aa0a6; }
+    .filters { display: flex; gap: 10px; font-size: 11px; color: #9aa0a6; align-items: center; }
+    .filters input { margin-right: 4px; }
+    .timeline-strip { display: flex; gap: 10px; overflow-x: auto; padding: 6px 2px 2px; scroll-behavior: smooth; max-height: 140px; }
+    .timeline-item { min-width: 140px; max-width: 180px; background: #0b0d10; border-radius: 8px; border: 1px solid #1d2128; padding: 6px; cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
+    .timeline-item.active { border-color: #4f8cff; box-shadow: 0 0 0 1px rgba(79, 140, 255, 0.4); }
+    .timeline-thumb-container { width: 100%; height: 70px; border-radius: 6px; background: #000; position: relative; overflow: hidden; }
+    .timeline-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .timeline-thumb-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #5f6368; font-size: 10px; background: #1d2128; }
+    .timeline-meta { font-size: 11px; color: #9aa0a6; display: flex; justify-content: space-between; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 999px; font-size: 10px; }
+    .badge-lighting { background: rgba(245, 196, 48, 0.15); color: #f5c430; }
+    .badge-camera { background: rgba(80, 158, 255, 0.15); color: #509eff; }
+    .badge-scene { background: rgba(244, 114, 182, 0.15); color: #f472b6; }
+    .analytics-row h3 { margin-bottom: 0; }
+    .chart-container { position: relative; height: 260px; max-height: 260px; }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <strong>Domain Shift Detector</strong>
+      <span id="status">Idle</span>
+      <div class="spacer"></div>
+    </div>
+    <div class="tabs">
+      <button class="tab-button active" data-tab="monitor">Monitor</button>
+      <button class="tab-button" data-tab="analytics">Analytics</button>
+    </div>
+  </header>
+  <main>
+    <section id="monitorView">
+      <div class="controls panel">
+        <div class="row">
+          <label style="width:140px">Video/YouTube Link</label>
+          <input id="source" type="text" placeholder="https://..." style="flex:1" />
+        </div>
+        <div class="row">
+          <label style="width:140px">US Timezone</label>
+          <select id="tz">
+            {% for tz in us_tzs %}
+            <option value="{{ tz }}">{{ tz }}</option>
+            {% endfor %}
+          </select>
+          <button id="startBtn">Start</button>
+          <button id="stopBtn" disabled>Stop</button>
+          <button id="downloadBtn">Download CSV</button>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="panel">
+          <h3>Live</h3>
+          <img id="video" src="/stream" alt="live stream" />
+          <div class="panel" style="margin-top: 12px; padding: 10px;">
+            <h3 style="margin-top: 0;">Statistics</h3>
+            <div id="videoStats" style="font-size: 12px; color: #9aa0a6;">
+              <div>Status: <span id="statStatus">Idle</span></div>
+              <div>FPS: <span id="statFPS">–</span></div>
+              <div>Processing: <span id="statProcessingFPS">–</span></div>
+              <div>Progress: <span id="statProgress">–</span></div>
+              <div>Frames: <span id="statFrames">–</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>History</h3>
+          <table>
+            <thead>
+              <tr><th>When</th><th>Label</th><th>Score</th><th>Snapshot</th></tr>
+            </thead>
+            <tbody id="history"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="analyticsView" class="hidden">
+      <div class="panel">
+        <h3>Analytics Overview</h3>
+        <div class="summary-grid">
+          <div class="summary-card">
+            <div class="summary-label">Total events</div>
+            <div class="summary-value" id="sumTotalEvents">0</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-label">By label</div>
+            <div class="summary-chips" id="sumByLabel"></div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-label">Time span</div>
+            <div class="summary-value" id="sumTimeSpan">–</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-label">Avg score</div>
+            <div class="summary-value" id="sumAvgScore">–</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-label">Last event</div>
+            <div class="summary-value" id="sumLastEvent">–</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="row analytics-row">
+          <h3>Scores over time</h3>
+          <div class="spacer"></div>
+          <div class="filters">
+            <label><input type="checkbox" class="label-filter" value="lighting_change" checked /> Lighting</label>
+            <label><input type="checkbox" class="label-filter" value="camera_motion" checked /> Camera motion</label>
+            <label><input type="checkbox" class="label-filter" value="scene_or_object_change" checked /> Scene/object</label>
+          </div>
+        </div>
+        <div style="position: relative; height: 260px;">
+          <canvas id="scoreChart"></canvas>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="row">
+          <h3>Timeline</h3>
+        </div>
+        <div id="timeline" class="timeline-strip" tabindex="0"></div>
+      </div>
+    </section>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="/static/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,375 @@
+# Domain Shift Detector – Full Application Explanation
+
+This document explains the entire application in depth: architecture, data flow, every module (`main.py`, `webapp.py`, `model.py`), templates (`templates/index.html`), frontend logic (`static/main.js`), configuration (`requirements.txt`), and runtime outputs. Code identifiers are referenced using inline code for precision.
+
+---
+
+## 1) High‑Level Overview
+
+- **Purpose**: Detect meaningful scene changes (“domain shifts”) in live or streamed video (webcam/file/RTSP/YouTube) using a hybrid of fast image statistics and a lightweight semantic signal from MobileNetV2 embeddings.
+- **Outputs**:
+  - JSONL run log at `out/events.jsonl` with a `run_start` header and per‑event lines.
+  - Snapshot images in `out/snapshots/` for start, periodic, and per‑event captures.
+  - CSV export over HTTP via `GET /download.csv` mapping events → snapshot filenames/URLs.
+- **Interfaces**:
+  - CLI app: `python main.py [flags...]`.
+  - Web UI: `python webapp.py` at `http://127.0.0.1:5000` with live MJPEG stream and event history via SSE.
+- **Optional CNN**: If `torch`/`torchvision` are installed, MobileNetV2 embeddings augment the score; otherwise, the system still runs with the CNN path disabled.
+
+---
+
+## 2) Project Structure
+
+- `model.py` – Core detector implementation.
+- `main.py` – CLI application (timezone inference, YouTube URL resolution, capture loop, logs/snapshots).
+- `webapp.py` – Flask server, worker thread, MJPEG streaming (`/stream`), Server‑Sent Events (`/events`), start/stop endpoints, CSV export, and snapshot serving.
+- `templates/index.html` – UI markup and basic styling.
+- `static/main.js` – Frontend logic for control buttons, EventSource handling, and history rendering.
+- `requirements.txt` – Python dependencies (optionally install torch/torchvision separately).
+- `README.md` – Quickstart, usage, tuning, and troubleshooting.
+
+---
+
+## 3) Core Detector (`model.py`)
+
+### 3.1 Imports and dependencies
+- Uses `cv2` (OpenCV), `numpy`, and `skimage.metrics.ssim` for image processing.
+- Optionally imports `torch` and `torchvision.models` (if unavailable, the CNN path is disabled gracefully).
+
+### 3.2 `DetectorConfig` dataclass
+- Fields:
+  - `resize=(640, 360)`: internal processing size (width, height).
+  - `window_seconds=3.0`: EMA time constant (s) controlling adaptation speed.
+  - `threshold=1.0`: event score threshold.
+  - `debounce=8`: number of consecutive frames above `threshold` required to fire.
+  - `cooldown_seconds=1.0`: min seconds between events.
+  - `weights=(1.0, 0.6, 0.6, 1.0)`: weights for histogram L1, brightness diff, edge diff, and SSIM distance.
+  - `use_cnn=True`: enable CNN feature distance.
+  - `cnn_weight=1.0`: weight added to the score for the CNN component.
+
+### 3.3 `DomainShiftDetector`
+- Maintains EMAs of multiple features and last‑frame state:
+  - `ema_hist`, `ema_brightness`, `ema_edge`, `ema_gray`, and `ema_embed` (if CNN enabled).
+  - `last_time` (timestamp), `exceed_count` for debounce, and `last_event_time` for cooldown.
+  - Diagnostics: `last_score`, `last_components`, and `last_label` for UI/CLI overlay and logs.
+
+#### 3.3.1 `_alpha(now)`
+- Computes per‑frame EMA coefficient using an exponential kernel based on time delta `dt` and `window_seconds`.
+- Returns `alpha = 1 − exp(−dt/window)`; on the very first frame, returns `1.0` to initialize EMAs immediately.
+
+#### 3.3.2 `_prep(frame)`
+- Resizes to `cfg.resize`, converts to HSV and grayscale, computes Canny edges.
+- Returns `(hsv, gray, edges)`.
+
+#### 3.3.3 `_init_cnn()`
+- Attempts to build a MobileNetV2 backbone as a frozen feature extractor:
+  - `features → AdaptiveAvgPool2d(1,1) → Flatten`.
+  - Parameters are `requires_grad=False`, and module is set to `eval()`.
+- Robust to different torchvision versions: tries `pretrained=True`, then weight enum fallback.
+- If any import/weight error occurs, returns `None` (CNN component disabled).
+
+#### 3.3.4 `_cnn_embed(frame_bgr)`
+- Preprocesses frame to 224×224 RGB, normalizes with ImageNet mean/std, converts to CHW tensor, and forwards through CNN.
+- L2‑normalizes the output vector (1280‑D for MobileNetV2) to unit length.
+- Returns a `np.ndarray` embedding or `None` if CNN is not available.
+
+#### 3.3.5 Low‑level feature helpers
+- `_hist_hs(hsv)` – 2D HS histogram with 16×16 bins, L1‑normalized, flattened.
+- `_brightness(hsv)` – Mean of V channel scaled to [0,1].
+- `_edge_density(edges)` – Fraction of edge pixels (non‑zero) in Canny result.
+- `_ssim_to_ema(gray)` – `1 − SSIM(gray, ema_gray)`; 0 on first frame; robust to exceptions.
+
+#### 3.3.6 `step(frame, now=None)` – Main per‑frame update
+- Prepares frame → computes features: `hist`, `brightness`, `edge`, `ssim_dist`.
+- Computes `embed` via `_cnn_embed` if `use_cnn` and CNN available.
+- Initializes EMAs on first call (returns `None` to avoid spurious event at t0).
+- Computes distances to EMAs:
+  - `hist_l1 = |hist − ema_hist|₁`
+  - `bright_d = |brightness − ema_brightness|`
+  - `edge_d = |edge − ema_edge|`
+- Aggregates score: `score = w_hist*hist_l1 + w_b*bright_d + w_e*edge_d + w_s*ssim_dist (+ cnn_weight*cnn_d)` where `cnn_d = 1 − cos(embed, ema_embed)`.
+- Updates EMAs with `alpha` (including normalized `ema_embed`).
+- Debounce/cooldown logic:
+  - Increase `exceed_count` if `score > threshold`, else reset to 0.
+  - If `exceed_count >= debounce` and `(now − last_event_time) >= cooldown_seconds`, then:
+    - Categorize label via `_categorize()` and return an event dict:
+      - `{"time", "score", "label", "components", "threshold"}`
+    - Also updates `last_label`, `last_event_time`, and resets `exceed_count`.
+- Always updates `last_score` and `last_components` for UI rendering.
+
+#### 3.3.7 `_categorize(hist_l1, bright_d, edge_d, ssim_d)`
+- Heuristics to label events:
+  - Large brightness change with small hist/edge change → `"lighting_change"`.
+  - Large SSIM distance and edge change with small brightness change → `"camera_motion"`.
+  - Otherwise → `"scene_or_object_change"`.
+
+---
+
+## 4) CLI Application (`main.py`)
+
+### 4.1 Imports and initialization
+- Handles Windows console `msvcrt` for quit key, optional `yt_dlp`, timezone via `zoneinfo.ZoneInfo`, and simple HTTP queries for IP/place‑based timezone inference.
+
+### 4.2 Argument parsing: `parse_args()`
+- Key flags:
+  - `--source` or positional `pos_source` (file/RTSP/URL/YouTube/webcam index string like `"0"`).
+  - Detection: `--threshold`, `--window`, `--debounce`, `--cooldown`.
+  - Output: `--out` directory, `--display` overlay window.
+  - Snapshots: `--snapshots/--no-snapshots`, `--snapshot-interval`, `--save-first`.
+  - CNN: `--use-cnn/--no-cnn`, `--cnn-weight`.
+  - Timezone: `--tz` (IANA), `--place` (geocode then tz lookup over HTTP), `--auto-tz-ip`.
+  - Control: `--max-frames` to cap frames for testing.
+- Positional source overrides `--source` if present.
+
+### 4.3 YouTube detection and resolution
+- `is_youtube(url)` – check if URL is YouTube.
+- `resolve_youtube_stream(url)` – use `yt_dlp` to fetch a directly playable URL (prefer HTTPS/HTTP/M3U8), robust fallback to any available format.
+
+### 4.4 Timezone helpers
+- `infer_tz_from_ip()` – tries multiple public endpoints (`worldtimeapi`, `ipapi`, `ip-api`) to get timezone.
+- `geocode_place_to_latlon(place)` – calls OpenStreetMap Nominatim to geocode.
+- `infer_tz_from_place(place)` – calls timeapi.io with lat/lon to get IANA timezone.
+- All helpers swallow exceptions and return empty strings on failure to keep the CLI resilient.
+
+### 4.5 Capture opening: `open_capture(source)`
+- Webcam indices (numeric strings) → `cv2.VideoCapture(int(index))`.
+- YouTube URLs resolved via `resolve_youtube_stream` if possible; otherwise, try raw URL.
+- Fallback: if default backend fails to open, retries with `cv2.CAP_FFMPEG`.
+
+### 4.6 Main run loop: `main()`
+- Prepares output paths `out/` and `out/snapshots/`; opens `out/events.jsonl` for write.
+- Determines timezone:
+  - Priority: `--tz` > `--place` > `--auto-tz-ip` > local.
+  - Builds `tzinfo` for timestamp formatting; writes `run_start` header to JSONL with config.
+- Builds `DetectorConfig` and `DomainShiftDetector` from args.
+- Opens capture; error if not opened.
+- Loop per frame:
+  - `event = det.step(frame, now=time.time())`.
+  - If event:
+    - Fill `time_iso` and `tz`, write event JSONL.
+    - Save snapshot (if `--snapshots`), name: `"<epoch>_<label>_<score>.jpg"`.
+    - Print concise console line with components.
+  - Periodic snapshot if `--snapshot-interval > 0`.
+  - First snapshot if `--save-first`.
+  - If `--display`:
+    - Overlay text `score=<...> thr=<...> label=<...>` and show window.
+    - Allow quitting with `q`/Esc or when window closed.
+  - Also allows console `q`/Esc via `msvcrt` on Windows.
+  - Stops on reaching `--max-frames` if provided.
+- Cleanup: release capture, close log file, destroy window if used.
+
+---
+
+## 5) Web Server (`webapp.py`)
+
+### 5.1 Globals and paths
+- `US_TZS` – whitelist of selectable US timezones in UI.
+- `PROJECT_ROOT`, `OUT_DIR`, `LOG_PATH`, `SNAP_DIR` – filesystem layout for logs/snapshots.
+- `app = Flask(__name__)` – Flask app instance.
+
+### 5.2 YouTube utilities
+- `is_youtube(url)`, `resolve_youtube_stream(url)` – identical strategy to CLI for resolving to a playable URL (requires `yt_dlp`).
+
+### 5.3 Video capture helper
+- `open_capture(source)` – same logic as CLI: webcam index, resolve YouTube, fallback to FFMPEG backend.
+
+### 5.4 Runtime configuration and state
+- `WorkerConfig` dataclass – per‑run config from UI:
+  - `source`, `tz_name`, plus detector‑related fields: `threshold`, `debounce`, `cooldown`, `use_cnn`, `cnn_weight`.
+- `ServerState` – thread‑safe state carrier:
+  - Thread handle, `stop_evt`, `running` flag, `cfg`, `tzinfo`, last JPEG buffer for streaming, SSE `subscribers`, cached `run_header`.
+  - `add_subscriber()` seeds new SSE clients with the `run_start` header if available.
+  - `broadcast(obj)` JSON‑serializes and non‑blocking pushes to each subscriber queue; prunes dead queues on errors.
+
+### 5.5 The detection worker thread: `detection_worker(cfg, state)`
+- Ensures output directories exist; opens JSONL log; emits and broadcasts `run_start` header with effective config and timezone.
+- Instantiates `DetectorConfig` and `DomainShiftDetector` (3.0s window used in UI).
+- Opens capture; on failure, broadcasts error and logs then exits.
+- Loop until `stop_evt` set or capture ends:
+  - Grabs a frame; computes `event = det.step(frame, now=time.time())`.
+  - Builds an `overlay` image with score/threshold/label and a timestamp (`tzinfo` aware) and encodes to JPEG (quality=80) into `state.last_jpeg` for streaming.
+  - Snapshot policy in the UI worker:
+    - Save a `start` snapshot once.
+    - Save a `periodic` snapshot every 10 seconds.
+    - When an event fires: write event JSONL line, broadcast the event over SSE, and save an event snapshot named `"<epoch>_<label>_<score>.jpg"`.
+- On any unhandled exception: broadcast an error message.
+- Always clears `state.running/thread/stop_evt` in `finally` to keep server consistent.
+
+### 5.6 Flask Routes
+- `GET /` – Renders `templates/index.html` and injects `US_TZS`.
+- `POST /start` – Validates input; stops existing run if needed; starts a new `Thread(target=detection_worker, daemon=True)` with `WorkerConfig` derived from request JSON.
+- `POST /stop` – Signals the worker to stop and joins briefly.
+- `GET /stream` – MJPEG streaming response; yields boundary frames (`--frame`) using `state.last_jpeg`, with a 100ms wait between chunks.
+- `GET /events` – SSE endpoint; for each subscriber queue, yields `data: <json>\n\n` for events and `run_start` header; sends periodic pings to keep the connection alive.
+- `GET /snapshots/<path:filename>` – Static handler to serve saved JPEGs from `SNAP_DIR`.
+- `GET /download.csv` – Reads `out/events.jsonl`, synthesizes rows for `run_start` and events, uses `_snapshot_name_for_event(ev)` to resolve a matching snapshot name, writes a CSV to a memory buffer, and returns it with a download content‑disposition.
+
+### 5.7 Snapshot name resolution: `_snapshot_name_for_event(ev)`
+- Tries the exact canonical name `"<int(time)>_<label>_<score:.2f>.jpg"` and returns it if exists.
+- Otherwise, scans by prefix `<int(time)>_*.jpg` to find a plausible match (first with label substring, else any by prefix).
+- Returns `None` on failure; CSV generator then leaves snapshot fields empty.
+
+---
+
+## 6) Frontend (`templates/index.html` + `static/main.js`)
+
+### 6.1 `templates/index.html`
+- Minimal dark UI with three primary control buttons: Start, Stop, Download CSV.
+- Controls:
+  - Text input `#source` for video/YouTube link.
+  - Select `#tz` populated from `us_tzs` Jinja variable (server‑provided whitelist).
+  - Buttons `#startBtn`, `#stopBtn`, `#downloadBtn`.
+- Panels:
+  - Live panel: `<img id="video" src="/stream" />` displays MJPEG.
+  - History panel: a table with `<tbody id="history">` where events are appended.
+- Header status: `#status` shows run state messages.
+
+### 6.2 `static/main.js`
+- Grabs DOM elements and manages `evtSrc` (`EventSource`) lifecycle.
+- `setStatus(text)` – updates status text in header.
+- `addEventRow(ev)` – appends a table row for an event:
+  - Columns: When (`ev.time_iso`), Label, Score (fixed to 3 decimals), Snapshot link.
+  - Snapshot URL is constructed using canonical filename `"<epoch>_<label>_<score:.2f>.jpg"` and points to `/snapshots/<name>` in a new tab.
+- `startRun()` – POSTs `/start` with `{source, tz}` from controls, enables Stop, disables Start, sets `evtSrc = new EventSource('/events')`:
+  - On message: parses JSON; appends `run_start` header as a row, handles `error` type, and appends any event with a `label`.
+- `stopRun()` – POSTs `/stop`, closes `evtSrc`, toggles buttons back, sets status.
+- `downloadBtn` – navigates to `/download.csv` to trigger a CSV download.
+
+---
+
+## 7) Data Model and Logs
+
+### 7.1 JSONL Log (`out/events.jsonl`)
+- First line is always the header:
+  - `{"type":"run_start","time":<epoch>,"time_iso":"...","source":"...","threshold":...,"window":...,"debounce":...,"cooldown":...,"tz":"..."}`
+- Event lines contain:
+  - `time`, `time_iso` (set by CLI/UI before logging), `tz` (selected or local).
+  - `label`: `lighting_change | camera_motion | scene_or_object_change`.
+  - `score` and `components` object with keys: `hist`, `brightness`, `edge`, `ssim`, `cnn`.
+  - `threshold` – effective threshold used to trigger the event.
+
+### 7.2 Snapshots (`out/snapshots/`)
+- Start snapshot at run begin; periodic snapshots (every 10s in UI worker; CLI interval configurable); per‑event snapshots with canonical naming.
+- Event snapshot file name: `"<epoch>_<label>_<score>.jpg"` – score formatted to 2 decimals.
+
+### 7.3 CSV (`GET /download.csv`)
+- Merges header and events into one CSV with columns:
+  - `type,time,time_iso,tz,source,threshold,debounce,cooldown,window,label,score,hist,brightness,edge,ssim,cnn,snapshot,snapshot_url`
+- Uses `_snapshot_name_for_event()` to find the best snapshot filename for each event and includes `/snapshots/<name>` URL.
+
+---
+
+## 8) Scoring Algorithm Details
+
+- Feature components per frame vs EMA baseline:
+  - `hist_l1` – sum of absolute differences of normalized HS histogram bins.
+  - `bright_d` – absolute difference of mean brightness (V channel).
+  - `edge_d` – absolute difference of edge pixel densities.
+  - `ssim_dist` – `1 − SSIM(gray, ema_gray)`; higher means more structural difference.
+  - `cnn_d` – `1 − cos(embed, ema_embed)` when CNN is available.
+- Final score: `score = w_hist*hist_l1 + w_b*bright_d + w_e*edge_d + w_s*ssim_dist (+ cnn_weight*cnn_d)`.
+- Event conditions: score exceeds `threshold` for `debounce` consecutive frames and at least `cooldown_seconds` since previous event.
+- Labels categorized for interpretability using simple thresholds.
+
+---
+
+## 9) Timezone Handling
+
+- CLI priority: `--tz` (IANA) > `--place` (OSM+timeapi lookup) > `--auto-tz-ip` (public IP services) > local.
+- Web UI forces selection from a US timezone whitelist; timestamps and overlays use that.
+- All event times are stored in epoch seconds, with `time_iso` formatted using selected `tz` when logged.
+
+---
+
+## 10) Dependencies (`requirements.txt`)
+
+- `numpy`, `opencv-python`, `scipy`, `scikit-image` – core numeric/vision stack.
+- `yt-dlp` – resolve YouTube URLs to playable streams.
+- `tzdata` – timezone database for Windows.
+- `Flask` – web server and templating.
+- Optional: `torch`, `torchvision` (install per `README.md`) – enable CNN embeddings. Without it, the detector still works using only classical features.
+
+---
+
+## 11) Error Handling and Robustness
+
+- YouTube resolution warns and falls back to raw URL if resolution fails.
+- Capture opening retries with FFMPEG backend if default fails.
+- Timezone helpers swallow network errors and return empty strings to avoid aborting.
+- Web SSE sends keep‑alive pings and prunes dead subscribers.
+- Worker thread always resets shared state flags in `finally`.
+- Snapshot writes wrapped in `try/except` to avoid crashing the detection loop.
+
+---
+
+## 12) Performance and Tuning
+
+- Lowering `threshold`/`debounce` increases sensitivity; raising them reduces false positives.
+- `window_seconds` controls EMA responsiveness (shorter = faster adaptation but potentially noisier).
+- `cnn_weight` can be tuned to accentuate or de‑emphasize semantic changes.
+- Disable CNN (`--no-cnn`) for CPU‑constrained environments; quality remains acceptable for many scenarios.
+
+---
+
+## 13) Running the System
+
+- CLI example:
+  - `python main.py --source "https://www.youtube.com/watch?v=..." --display --tz "America/New_York" --threshold 0.08 --debounce 3 --save-first --snapshot-interval 10`
+- Web UI:
+  - `python webapp.py` → open `http://127.0.0.1:5000`, enter source and timezone, click Start.
+
+---
+
+## 14) API/Function Reference (Concise Per‑Symbol Summary)
+
+- `model.DetectorConfig` – configuration holder for detector.
+- `model.DomainShiftDetector` – main detector class.
+  - `step(frame, now=None)` → Optional[event dict].
+  - Helpers: `_alpha`, `_prep`, `_init_cnn`, `_cnn_embed`, `_hist_hs`, `_brightness`, `_edge_density`, `_ssim_to_ema`, `_categorize`.
+- `main.parse_args()` – CLI flag parsing.
+- `main.is_youtube(url)` / `webapp.is_youtube(url)` – YouTube URL test.
+- `main.resolve_youtube_stream(url)` / `webapp.resolve_youtube_stream(url)` – playable URL via `yt_dlp`.
+- `main.infer_tz_from_ip()` / `main.infer_tz_from_place(place)` – tz inference.
+- `main.open_capture(source)` / `webapp.open_capture(source)` – capture handle with fallbacks.
+- `main.main()` – CLI event loop, logging, snapshots, optional overlay.
+- `webapp.WorkerConfig` – server run config.
+- `webapp.ServerState` – shared server state for streaming and SSE.
+- `webapp.detection_worker(cfg, state)` – threaded run loop for web mode.
+- `webapp` routes: `/`, `/start`, `/stop`, `/stream`, `/events`, `/snapshots/<path>`, `/download.csv`.
+- Frontend `static/main.js` functions: `startRun`, `stopRun`, `addEventRow`, plus event wiring.
+
+---
+
+## 15) Extension Ideas
+
+- Pluggable backends for RTSP auth, multi‑stream orchestration.
+- Model upgrades: small ViT or MobileNetV3; on‑device quantization.
+- Smart labeling by training a shallow classifier on the feature vector.
+- Persist multiple runs by using unique run IDs and separate output subfolders.
+- Paginated history and thumbnail gallery in the web UI.
+
+---
+
+## 16) Key Invariants and Contracts
+
+- `DomainShiftDetector.step()` must be called with roughly monotonic `now` to preserve EMA stability.
+- Initialization frame never yields an event (returns `None`) and seeds EMAs.
+- Event dicts always contain `time`, `score`, `label`, `components`, and `threshold`; web/CLI add `time_iso` and `tz` at log time.
+- Snapshot filenames for events use score rounded to two decimals for consistency across UI and CSV.
+
+---
+
+## 17) End‑to‑End Flow Summary (Web UI)
+
+1. User clicks Start → `POST /start {source, tz}`.
+2. Server stops any existing run and spawns `detection_worker` with `WorkerConfig`.
+3. Worker logs and broadcasts `run_start`; frontend opens `EventSource('/events')` and appends header row.
+4. Worker reads frames, updates detector, encodes overlays to JPEG → `state.last_jpeg`.
+5. Browser `<img src="/stream">` pulls MJPEG; history table grows as SSE events arrive.
+6. Worker saves snapshots (start, periodic, per‑event) into `out/snapshots/`.
+7. On Stop, server signals `stop_evt`; worker exits and cleans up state.
+8. User can download `events.csv` mapping events to snapshot URLs.
+
+---
+
+This documentation covers each significant module, function, and data path in the application, detailing how frames are processed, how events are produced and displayed, and how artifacts are persisted and exported.
